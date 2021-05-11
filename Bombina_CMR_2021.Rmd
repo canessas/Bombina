@@ -1,0 +1,223 @@
+---
+title: "Bombina_CMR_2021"
+output: word_document
+---
+
+```{r data format}
+# Install the packages if necessary
+# if(!require("tidyverse")) install.packages("tidyverse")
+# if(!require("fs")) install.packages("fs")
+# if(!require("readxl")) install.packages("readxl")
+
+# Load packages
+library(tidyverse);library(fs);library(readxl)
+# Import data
+raw.data <- read_excel("CMR_bombina_2020.xlsx","Lorsica")
+# Separate capture history (store as character for now)
+CH <- raw.data[,-c(1:4,ncol(raw.data))] %>% mutate(across(everything(), as.character)) 
+
+# Clean up capture history
+CH[CH=="1,R"] <- "1" # Convert all captures in refugia to 1
+CH[CH=="#N/A"|CH=="<N/A>"] <- NA # Convert Excel NA format to R
+CH[is.na(CH)] <- "0" # Change NAs to zeros
+CH[CH!="0"] <- "1" # Convert all captures to 1
+# Convert all strings back to numbers
+CH <- CH %>% mutate(across(everything(), as.numeric)) 
+# Combine with ID and sex into a single data frame
+clean.df <- data.frame(raw.data[,1:4],CH)
+colnames(clean.df)[1:4] <- c("ID","Sex_F","Sex_L","YOB")
+
+# Clean up sex and age groups
+clean.df$YOB <- ifelse(clean.df$YOB==0,NA,clean.df$YOB) # Unknown years of birth
+
+# Remove animals with no captures
+which.remove <- which(rowSums(clean.df[,-c(1:4)])==0)
+clean.df <- clean.df[-which.remove,]
+
+# Extract survey dates and include as column names
+surv.dates <- format(as.Date(as.numeric(substring(colnames(CH), 1)), origin = "1899-12-30"),"%Y-%m-%d")
+colnames(clean.df)[5:ncol(clean.df)] <- as.character(surv.dates)
+head(clean.df)# Check
+
+### Age states matrix
+# Not coded yet
+
+# Convert ID to sequential number
+clean.df$ID <- 1:nrow(clean.df)
+
+```
+
+```{r NIMBLE model}
+
+# Specify model in BUGS language
+sink("js-ms-3pop.bug")
+cat("
+  model{
+    # --------------------------------------------------------------
+    # Parameters:
+    # Phi: survival probability
+    # gamma: entry probability
+    # p: capture probability
+    # --------------------------------------------------------------
+    # States:
+    # 1 not yet entered
+    # 2 alive
+    # 3 dead
+    # --------------------------------------------------------------
+    # Observations (O):
+    # 1 seen
+    # 2 not seen
+    # --------------------------------------------------------------
+    # Priors and constraints
+    for(t in 1:(n.occasions-1)){			# For each survey
+    phi[t] <- mean.phi
+    gamma[t] <- mean.gamma
+    }
+    
+    for(i in 1:M){
+    for(t in 1:(n.occasions-1)){			# For each survey
+    logit(p[i,t]) <- max(min(alpha.p
+    + beta.p*cos(date[t]*2*3.1416/365-offset) + re[pop[i]],
+    999), -999)
+    } # t
+    } # i
+    
+    # Site-level random effect: half-cauchy distribution with 25 df
+    for(i in 1:3){
+      re[i] ~ dnorm(0, tau)
+    }
+    tau <- pow(sigma, -2)
+    sigma ~ dunif(0,0.5)
+#     num ~ dnorm(0,1)
+#     den ~ dnorm(0,0.0016)
+#     tau <- pow(num/den, 2)
+
+    # Another possible specification of the half-cauchy(25)
+    # sigma ~ dt(0, 1/625, 1)
+    # sd.re <- abs(sigma)
+    # tau <- 1/pow(sd.re,2)
+
+    mean.gamma ~ dunif(0, 0.001)
+    mean.phi ~ dunif(0,1) # Prior for mean survival
+    alpha.p ~ dnorm(0, 0.0001)I(-10,10)
+    beta.p ~ dnorm(0, 0.001)I(-10,10)
+    offset ~ dunif(0, 6.283185)
+    
+    # Define state transition and observation matrices
+    for(i in 1:M){
+    # Define probabilities of state S(t+1) given S(t)
+    for(t in 1:(n.occasions-1)){
+    ps[1,i,t,1] <- 1-gamma[t]
+    ps[1,i,t,2] <- gamma[t]
+    ps[1,i,t,3] <- 0
+    ps[2,i,t,1] <- 0
+    ps[2,i,t,2] <- phi[t]
+    ps[2,i,t,3] <- 1-phi[t]
+    ps[3,i,t,1] <- 0
+    ps[3,i,t,2] <- 0
+    ps[3,i,t,3] <- 1
+    # Define probabilities of O(t) given S(t)
+    po[1,i,t,1] <- 0
+    po[1,i,t,2] <- 1
+    po[2,i,t,1] <- p[i,t]
+    po[2,i,t,2] <- 1-p[i,t]
+    po[3,i,t,1] <- 0
+    po[3,i,t,2] <- 1
+    } # t
+    } # i
+    
+    
+    for(t in 1:(n.occasions-1)){
+    p.lor1[t] <- 1/(1+exp(-alpha.p
+    - beta.p*cos(date[t]*2*3.1416/365-offset) + re[1]))
+    p.lor2[t] <- 1/(1+exp(-alpha.p
+    - beta.p*cos(date[t]*2*3.1416/365-offset) + re[2]))
+    p.pin[t] <- 1/(1+exp(-alpha.p
+    - beta.p*cos(date[t]*2*3.1416/365-offset) + re[3]))
+    }  
+    
+    # Likelihood
+    for(i in 1:M){
+    # Define latent state at first occasion
+    z[i,1] <- 1 # Make sure that all M individuals are in state 1 at t=1
+    for(t in 2:n.occasions){
+    # State process: draw S(t) fiven S(t-1)
+    z[i,t] ~ dcat(ps[z[i,t-1],i,t-1,])
+    # Observation process: draw O(t) given S(t)
+    y[i,t] ~ dcat(po[z[i,t],i,t-1,])
+    } # t
+    } # i
+    
+    # Make predictions across sampling season
+    for(i in 1:3){
+    for(j in 1:151){
+    logit(pred_p[j,i]) <- alpha.p
+    + beta.p*cos(pred_date[j]*2*3.1416/365-offset + re[i])
+    } # j
+    } # i
+    
+    # Calculate derived population parameters
+    for( t in 1:(n.occasions-1)){
+    qgamma[t] <- 1-gamma[t]
+    }
+    cprob[1] <- gamma[1]
+    for(t in 2:(n.occasions-1)){
+    cprob[t] <- gamma[t]*prod(qgamma[1:(t-1)])
+    } # t
+    psi <- sum(cprob[]) # Inclusion probability
+    for(t in 1:(n.occasions-1)){
+    b[t] <- cprob[t] / psi # Entry probability
+    } # t
+    
+    # Create vector to select by group
+    for(i in 1:M){
+    lor1[i] <- equals(pop[i],1)
+    lor2[i] <- equals(pop[i],2)
+    pin[i] <- equals(pop[i],3)
+    }
+    
+    for(i in 1:M){
+    for(t in 2:n.occasions){
+    al[i,t-1] <- equals(z[i,t],2)           # Living individuals at time t-1
+    al.lor1[i,t-1] <- al[i,t-1]*lor1[i]
+    al.lor2[i,t-1] <- al[i,t-1]*lor2[i]
+    al.pin[i,t-1] <-  al[i,t-1]*pin[i]
+    } # t
+    
+    for(t in 1:(n.occasions-1)){
+    d[i,t] <- equals(z[i,t]-al[i,t],0)     # Not-yet-entered individuals at time t
+    d.lor1[i,t] <- d[i,t]*lor1[i]
+    d.lor2[i,t] <- d[i,t]*lor2[i]
+    d.pin[i,t] <-  d[i,t]*pin[i]
+    } # t
+    
+    alive[i] <- sum(al[i,])                # Number of times i had been alive?
+    alive.lor1[i] <- sum(al.lor1[i,])
+    alive.lor2[i] <- sum(al.lor2[i,])
+    alive.pin[i] <- sum(al.pin[i,])
+    } # i
+    
+    for( t in 1:(n.occasions-1)){
+    N[t] <- sum(al[,t])                    # Actual population size (available and NYE) at time t
+    N.lor1[t] <- sum(al.lor1[,t])
+    N.lor2[t] <- sum(al.lor2[,t])
+    N.pin[t] <- sum(al.pin[,t])
+    B[t] <- sum(d[,t])                     # Number of entries
+    } # t
+    
+    for(i in 1:M){
+    w[i] <- 1-equals(alive[i],0)
+    w.lor1[i] <- 1-equals(alive.lor1[i],0)
+    w.lor2[i] <- 1-equals(alive.lor2[i],0)
+    w.pin[i] <- 1-equals(alive.pin[i],0)
+    } # i
+    Nsuper <- sum(w[]) # Superpopulation size
+    Nsuper.lor1 <- sum(w.lor1[]) # Superpopulation size
+    Nsuper.lor2 <- sum(w.lor2[]) # Superpopulation size
+    Nsuper.pin <- sum(w.pin[]) # Superpopulation size
+    
+  }
+    ", fill=TRUE)
+sink()
+
+```
